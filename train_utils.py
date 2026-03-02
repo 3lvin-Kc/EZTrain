@@ -7,9 +7,11 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
+    AutoModelForQuestionAnswering,
     TrainingArguments,
     Trainer,
     DataCollatorForTokenClassification,
+    DataCollatorWithPadding,
 )
 from datasets import load_dataset
 import numpy as np
@@ -45,6 +47,15 @@ def compute_metricsNER(eval_pred):
     flat_labels = [item for sublist in true_labels for item in sublist]
     return {'accuracy': accuracy_score(flat_labels, flat_preds)}
 
+def compute_metricsQA(eval_pred):
+    """Compute metrics for QA task."""
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=2)
+    from sklearn.metrics import exact_match, f1_score
+    em = exact_match(labels, predictions)
+    f1 = f1_score(labels, predictions, average='weighted')
+    return {'exact_match': em, 'f1': f1}
+
 from typing import Optional
 
 def start_training(
@@ -71,7 +82,7 @@ def start_training(
             if train_split < 1.0:
                 dataset = dataset.train_test_split(test_size=1-train_split, seed=seed)
 
-        if task == 'text-classification':
+        if task in ('text-classification', 'sentiment-analysis'):
             if label_column not in dataset['train'].column_names and 'label' in dataset['train'].column_names:
                 label_column = 'label'
             label_list = list(set(dataset['train'][label_column]))
@@ -94,6 +105,86 @@ def start_training(
             
             compute_metrics = compute_metricsClassification
             data_collator = None
+
+        elif task == 'question-answering':
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            def prepare_validation_features(examples):
+                tokenized = tokenizer(
+                    examples['question'] if 'question' in examples else examples['question_column'],
+                    examples['context'] if 'context' in examples else examples['context_column'],
+                    truncation='only_second',
+                    max_length=512,
+                    return_offsets_mapping=True,
+                    padding='max_length',
+                )
+                tokenized['example_id'] = []
+                for i in range(len(tokenized['offset_mapping'])):
+                    sample_id = i
+                    tokenized['example_id'].append(sample_id)
+                    sequence_ids = tokenized.sequence_ids(i)
+                    offset = tokenized['offset_mapping'][i]
+                    tokenized['offset_mapping'][i] = [
+                        o if sequence_ids[k] == 1 else None for k, o in enumerate(offset)
+                    ]
+                return tokenized
+            
+            def prepare_train_features(examples):
+                tokenized = tokenizer(
+                    examples['question'] if 'question' in examples else examples['question_column'],
+                    examples['context'] if 'context' in examples else examples['context_column'],
+                    truncation='only_second',
+                    max_length=512,
+                    return_offsets_mapping=True,
+                    padding='max_length',
+                )
+                offset = tokenized['offset_mapping']
+                start_positions = []
+                end_positions = []
+                for i, offsets in enumerate(offset):
+                    input_ids = tokenized['input_ids'][i]
+                    cls_index = input_ids.index(tokenizer.cls_token_id)
+                    sequence_ids = tokenized.sequence_ids(i)
+                    sample_index = 0
+                    if 'answers' in examples:
+                        answer = examples['answers'][i]
+                        start_char = answer['answer_start'][0] if isinstance(answer['answer_start'], list) else answer['answer_start']
+                        end_char = start_char + (len(answer['text'][0]) if isinstance(answer['text'], list) else len(answer['text']))
+                    else:
+                        start_char = 0
+                        end_char = 0
+                    
+                    token_start_index = 0
+                    while sequence_ids[token_start_index] != 1:
+                        token_start_index += 1
+                    token_end_index = len(input_ids) - 1
+                    while sequence_ids[token_end_index] != 1:
+                        token_end_index -= 1
+                    
+                    if not (offsets[token_start_index][0] <= start_char and offsets[token_end_index][1] >= end_char):
+                        start_positions.append(cls_index)
+                        end_positions.append(cls_index)
+                    else:
+                        while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
+                            token_start_index += 1
+                        start_positions.append(token_start_index - 1)
+                        while token_end_index >= 0 and offsets[token_end_index][1] >= end_char:
+                            token_end_index -= 1
+                        end_positions.append(token_end_index + 1)
+                
+                tokenized['start_positions'] = start_positions
+                tokenized['end_positions'] = end_positions
+                return tokenized
+            
+            if 'test' in dataset:
+                tokenized_dataset = dataset.map(prepare_validation_features, batched=True, remove_columns=dataset['test'].column_names)
+            else:
+                tokenized_dataset = dataset.map(prepare_train_features, batched=True, remove_columns=dataset['train'].column_names)
+            
+            model = AutoModelForQuestionAnswering.from_pretrained(model_name)
+            
+            compute_metrics = compute_metricsQA
+            data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
         elif task == 'token-classification':
             if label_column not in dataset['train'].column_names:
