@@ -2,3 +2,5 @@ click
 huggingface_hub
 datasets
 tqdm
+transformers
+scikit-learn

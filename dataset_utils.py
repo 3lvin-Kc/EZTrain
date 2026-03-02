@@ -3,7 +3,9 @@ from datasets import load_dataset
 
 logger = logging.getLogger(__name__)
 
-def validate_dataset(dataset_path: str, file_format: str, text_column: str, label_column: str = None) -> bool:
+from typing import Optional
+
+def validate_dataset(dataset_path: str, file_format: str, text_column: str, label_column: Optional[str] = None) -> bool:
     """Validate dataset format and required columns."""
     try:
         dataset = load_dataset(file_format, data_files=dataset_path)
